@@ -2,6 +2,7 @@ SFLaaS-NAS
 Designing Sustainable Federated Learning as a Service using Neural Architecture Search
 
 Overview
+
 SFLaaS-NAS is a sustainable Federated Learning as a Service (FLaaS) framework that integrates Neural Architecture Search (NAS) with consumer-level carbon constraints.
 
 The framework is designed for heterogeneous FLaaS environments where participating consumers operate under:
