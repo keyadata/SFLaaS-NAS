@@ -1,0 +1,415 @@
+
+!pip install medmnist -q
+
+import os
+import random
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+
+import medmnist
+from medmnist import INFO
+
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+DATA_FLAG = "pathmnist"   
+NUM_CLIENTS = 20
+NUM_ROUNDS = 5
+LOCAL_EPOCHS_MAX = 3
+BATCH_SIZE = 64
+
+POPULATION_SIZE = 6
+GENERATIONS = 2
+TOP_K = 16
+
+LR = 0.001
+
+# Fitness weights
+BETA_ACC = 0.55
+BETA_PART = 0.30
+BETA_CARBON = 0.15
+
+# Scheduler weights
+LAMBDA_BUDGET = 0.4
+LAMBDA_DATA = 0.3
+LAMBDA_EFF = 0.3
+
+# Load MedMNIST Dataset
+
+info = INFO[DATA_FLAG]
+DataClass = getattr(medmnist, info["python_class"])
+NUM_CLASSES = len(info["label"])
+N_CHANNELS = info["n_channels"]
+
+train_dataset = DataClass(split="train", download=True)
+test_dataset = DataClass(split="test", download=True)
+
+def transform_x(x):
+    x = torch.tensor(np.array(x), dtype=torch.float32)
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+    else:
+        x = x.permute(2, 0, 1)
+    return x / 255.0
+
+class MedMNISTWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        x, y = self.dataset[idx]
+        x = transform_x(x)
+        y = torch.tensor(y).long().view(-1)[0]
+        return x, y
+
+train_dataset = MedMNISTWrapper(train_dataset)
+test_dataset = MedMNISTWrapper(test_dataset)
+
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+
+# -----------------------------
+# Non-IID Client Partition
+# -----------------------------
+def create_non_iid_clients(dataset, num_clients):
+    label_to_indices = defaultdict(list)
+
+    for idx in range(len(dataset)):
+        _, y = dataset[idx]
+        label_to_indices[int(y)].append(idx)
+
+    for y in label_to_indices:
+        random.shuffle(label_to_indices[y])
+
+    client_indices = [[] for _ in range(num_clients)]
+
+    for label, indices in label_to_indices.items():
+        chunks = np.array_split(indices, num_clients)
+        for i in range(num_clients):
+            client_indices[i].extend(chunks[i].tolist())
+
+    for i in range(num_clients):
+        random.shuffle(client_indices[i])
+
+    return client_indices
+
+client_indices = create_non_iid_clients(train_dataset, NUM_CLIENTS)
+
+client_loaders = []
+client_data_sizes = []
+
+for idxs in client_indices:
+    subset = Subset(train_dataset, idxs)
+    loader = DataLoader(subset, batch_size=BATCH_SIZE, shuffle=True)
+    client_loaders.append(loader)
+    client_data_sizes.append(len(subset))
+
+client_data_sizes = np.array(client_data_sizes)
+
+#  Consumer Profiles
+eta = np.random.uniform(2.0, 5.0, NUM_CLIENTS)        # GFLOPs/J
+carbon_budget = np.random.uniform(800, 2000, NUM_CLIENTS)
+rho = np.random.uniform(0.5, 1.5, NUM_CLIENTS)
+
+def carbon_intensity(round_id):
+    return np.random.uniform(150, 500, NUM_CLIENTS)
+
+# -----------------------------
+# Search Space
+# -----------------------------
+search_space = {
+    "depth": [2, 3, 4],
+    "width": [16, 32, 64],
+    "kernel": [3, 5],
+    "operator": ["conv", "dwconv"],
+    "sparsity": [0.0, 0.25, 0.5],
+    "precision": [16, 32]
+}
+
+def sample_architecture():
+    return {
+        "depth": random.choice(search_space["depth"]),
+        "width": random.choice(search_space["width"]),
+        "kernel": random.choice(search_space["kernel"]),
+        "operator": random.choice(search_space["operator"]),
+        "sparsity": random.choice(search_space["sparsity"]),
+        "precision": random.choice(search_space["precision"])
+    }
+
+def estimate_flops_params(arch):
+    d = arch["depth"]
+    w = arch["width"]
+    k = arch["kernel"]
+    sparsity = arch["sparsity"]
+    precision = arch["precision"]
+    op_factor = 0.35 if arch["operator"] == "dwconv" else 1.0
+    precision_factor = precision / 32
+
+    flops = d * w * w * k * k * op_factor * (1 - sparsity) * 0.001
+    params = d * w * w * k * k * op_factor * (1 - sparsity) * precision_factor * 0.0001
+
+    return flops, params
+
+
+class NASCNN(nn.Module):
+    def __init__(self, arch):
+        super().__init__()
+
+        layers = []
+        in_channels = N_CHANNELS
+        width = arch["width"]
+        kernel = arch["kernel"]
+        padding = kernel // 2
+
+        for _ in range(arch["depth"]):
+            if arch["operator"] == "dwconv" and in_channels == width:
+                layers.append(nn.Conv2d(in_channels, in_channels, kernel, padding=padding, groups=in_channels))
+                layers.append(nn.Conv2d(in_channels, width, 1))
+            else:
+                layers.append(nn.Conv2d(in_channels, width, kernel, padding=padding))
+
+            layers.append(nn.BatchNorm2d(width))
+            layers.append(nn.ReLU())
+            layers.append(nn.MaxPool2d(2))
+            in_channels = width
+
+        self.features = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(width, NUM_CLASSES)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+
+def carbon_cost(arch, client_id, epochs, ci_t):
+    flops, params = estimate_flops_params(arch)
+
+    train_carbon = (epochs * flops * client_data_sizes[client_id] / eta[client_id]) * ci_t[client_id] * 1e-6
+    comm_carbon = (rho[client_id] * params) * ci_t[client_id] * 1e-3
+
+    return train_carbon + comm_carbon
+
+def allocate_epochs(client_id, remaining_budget):
+    epoch = int(max(1, np.floor(LOCAL_EPOCHS_MAX * remaining_budget[client_id] / carbon_budget[client_id])))
+    return epoch
+
+def carbon_aware_scheduler(arch, remaining_budget, round_id):
+    ci_t = carbon_intensity(round_id)
+    feasible_clients = []
+
+    for i in range(NUM_CLIENTS):
+        e_i = allocate_epochs(i, remaining_budget)
+        cost = carbon_cost(arch, i, e_i, ci_t)
+
+        if cost <= remaining_budget[i]:
+            feasible_clients.append(i)
+
+    if len(feasible_clients) == 0:
+        return [], {}, ci_t
+
+    scores = {}
+
+    for i in feasible_clients:
+        carbon_availability = remaining_budget[i] / carbon_budget[i]
+        data_contribution = client_data_sizes[i] / np.sum(client_data_sizes)
+        carbon_efficiency = eta[i] / ci_t[i]
+
+        score = (
+            LAMBDA_BUDGET * carbon_availability +
+            LAMBDA_DATA * data_contribution +
+            LAMBDA_EFF * carbon_efficiency
+        )
+
+        scores[i] = score
+
+    selected_clients = sorted(scores, key=scores.get, reverse=True)[:TOP_K]
+
+    epoch_plan = {}
+    for i in selected_clients:
+        epoch_plan[i] = allocate_epochs(i, remaining_budget)
+
+    return selected_clients, epoch_plan, ci_t
+
+
+def local_train(model, loader, epochs):
+    model.train()
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    for _ in range(epochs):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad()
+            output = model(x)
+            loss = criterion(output, y)
+            loss.backward()
+            optimizer.step()
+
+    return model.state_dict()
+
+def fedavg(state_dicts, weights):
+    avg_state = {}
+
+    for key in state_dicts[0].keys():
+        avg_state[key] = sum(
+            state_dicts[i][key] * weights[i]
+            for i in range(len(state_dicts))
+        )
+
+    return avg_state
+
+def evaluate(model):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            output = model(x)
+            pred = output.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+
+    return 100 * correct / total
+
+def evaluate_architecture(arch):
+    global_model = NASCNN(arch).to(device)
+    remaining_budget = carbon_budget.copy()
+
+    total_selected = 0
+    total_violations = 0
+    round_accuracies = []
+    carbon_utilities = []
+
+    for t in range(NUM_ROUNDS):
+        selected_clients, epoch_plan, ci_t = carbon_aware_scheduler(arch, remaining_budget, t)
+
+        if len(selected_clients) == 0:
+            continue
+
+        local_states = []
+        local_weights = []
+
+        for client_id in selected_clients:
+            local_model = NASCNN(arch).to(device)
+            local_model.load_state_dict(global_model.state_dict())
+
+            e_i = epoch_plan[client_id]
+            cost = carbon_cost(arch, client_id, e_i, ci_t)
+
+            if cost > remaining_budget[client_id]:
+                total_violations += 1
+                continue
+
+            state = local_train(local_model, client_loaders[client_id], e_i)
+            local_states.append(state)
+            local_weights.append(client_data_sizes[client_id])
+
+            remaining_budget[client_id] -= cost
+            total_selected += 1
+
+        if len(local_states) > 0:
+            local_weights = np.array(local_weights) / np.sum(local_weights)
+            new_state = fedavg(local_states, local_weights)
+            global_model.load_state_dict(new_state)
+
+        acc = evaluate(global_model)
+        round_accuracies.append(acc)
+
+        carbon_utility = np.mean(remaining_budget / carbon_budget)
+        carbon_utilities.append(carbon_utility)
+
+    final_accuracy = round_accuracies[-1] if round_accuracies else 0
+    participation = 100 * total_selected / (NUM_ROUNDS * NUM_CLIENTS)
+    violation = 100 * total_violations / max(total_selected + total_violations, 1)
+
+    fitness = (
+        BETA_ACC * (final_accuracy / 100) +
+        BETA_PART * (participation / 100) +
+        BETA_CARBON * np.mean(carbon_utilities)
+    )
+
+    return {
+        "Architecture": str(arch),
+        "Accuracy (%)": final_accuracy,
+        "Participation (%)": participation,
+        "Violation (%)": violation,
+        "Fitness": fitness
+    }
+
+# -----------------------------
+# Evolutionary NAS
+# -----------------------------
+population = [sample_architecture() for _ in range(POPULATION_SIZE)]
+all_results = []
+
+for generation in range(GENERATIONS):
+    print(f"\nGeneration {generation + 1}/{GENERATIONS}")
+
+    generation_results = []
+
+    for arch in population:
+        result = evaluate_architecture(arch)
+        result["Generation"] = generation + 1
+        generation_results.append(result)
+        all_results.append(result)
+
+        print(result)
+
+    generation_results = sorted(generation_results, key=lambda x: x["Fitness"], reverse=True)
+    elites = generation_results[:2]
+
+    new_population = []
+
+    for elite in elites:
+        arch = eval(elite["Architecture"])
+        new_population.append(arch)
+
+    while len(new_population) < POPULATION_SIZE:
+        parent = eval(random.choice(elites)["Architecture"])
+        child = parent.copy()
+
+        mutation_key = random.choice(list(search_space.keys()))
+        child[mutation_key] = random.choice(search_space[mutation_key])
+
+        new_population.append(child)
+
+    population = new_population
+
+
+df_all = pd.DataFrame(all_results)
+best = df_all.sort_values("Fitness", ascending=False).iloc[0]
+
+final_result = pd.DataFrame([{
+    "Method": "Ours",
+    "Dataset": DATA_FLAG,
+    "Accuracy (%)": round(best["Accuracy (%)"], 2),
+    "Participation (%)": round(best["Participation (%)"], 2),
+    "Violation (%)": round(best["Violation (%)"], 2),
+    "Best Architecture": best["Architecture"],
+    "Fitness": round(best["Fitness"], 4)
+}])
+
+final_result.to_csv("ours_framework_medmnist_results.csv", index=False)
+
+final_result
