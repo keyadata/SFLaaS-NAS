@@ -1,6 +1,6 @@
 # SFLaaS-NAS
 
-Anonymous implementation repository for the paper submitted to ICONIP 2026.
+Anonymous implementation repository.
 
 ## Requirements
 - Python 3.10
