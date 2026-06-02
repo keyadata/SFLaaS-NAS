@@ -11,4 +11,15 @@ SFLaaS-NAS optimises model accuracy, consumer participation, carbon feasibility,
 
 The framework introduces feasibility-aware architecture filtering, consumer-level carbon feasibility estimation, dynamic carbon-aware scheduling, and sustainability-guided evolutionary NAS.
 
--Contain the Anonymous implementation repository.
+Dataset
+
+The experiments use the following datasets:
+
+CIFAR-10
+MedMNIST (PathMNIST)
+ImageNet-100
+Dataset Sources
+CIFAR-10: https://www.cs.toronto.edu/~kriz/cifar.html
+MedMNIST: https://medmnist.com/
+ImageNet: https://www.image-net.org/
+WISDM: https://doi.org/10.24432/C5HK59
